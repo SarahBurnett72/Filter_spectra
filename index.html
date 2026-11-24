@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Optical Filter Transmission Viewer</title>
+  <!-- Plotly for interactive scientific charting & PapaParse for robust CSV parsing -->
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+  <style>
+    :root {
+      --bg: #f8fafc;
+      --card: #ffffff;
+      --border: #e2e8f0;
+      --text: #0f172a;
+      --muted: #64748b;
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+    }
+    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { margin: 0; background: var(--bg); color: var(--text); padding: 20px; }
+    .container { max-width: 1300px; margin: 0 auto; display: grid; grid-template-columns: 340px 1fr; gap: 20px; }
+    @media (max-width: 900px) { .container { grid-template-columns: 1fr; } }
+    
+    .panel { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    h1 { font-size: 1.25rem; margin: 0 0 14px 0; }
+    h2 { font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 16px 0 8px 0; }
+    
+    .controls { display: flex; flex-direction: column; gap: 10px; }
+    input, select { width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; font-size: 0.9rem; }
+    .row { display: flex; gap: 8px; }
+    
+    .filter-list { max-height: 280px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; margin-top: 8px; }
+    .filter-item { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 0.88rem; }
+    .filter-item:last-child { border-bottom: none; }
+    .filter-meta { display: flex; flex-direction: column; }
+    .filter-name { font-weight: 600; }
+    .filter-sub { font-size: 0.78rem; color: var(--muted); }
+    
+    button { cursor: pointer; border: none; border-radius: 5px; padding: 6px 10px; font-size: 0.82rem; font-weight: 500; transition: 0.15s; }
+    .btn-add { background: var(--primary); color: white; }
+    .btn-add:hover { background: var(--primary-hover); }
+    .btn-add:disabled { background: #94a3b8; cursor: default; }
+    .btn-clear { background: #fee2e2; color: #b91c1c; width: 100%; margin-top: 8px; padding: 8px; }
+    .btn-clear:hover { background: #fecaca; }
+
+    .active-tags { display: flex; flex-wrap: wrap; gap: 6px; min-height: 32px; }
+    .tag { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 20px; font-size: 0.82rem; font-weight: 500; color: white; }
+    .tag button { background: rgba(0,0,0,0.2); color: white; padding: 0 5px; border-radius: 50%; font-size: 0.75rem; line-height: 1.4; }
+    .tag button:hover { background: rgba(0,0,0,0.4); }
+
+    #chart { width: 100%; height: 620px; }
+    .status { font-size: 0.85rem; color: var(--muted); padding: 10px; text-align: center; }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <!-- Left Sidebar: Search & Selection -->
+  <div class="panel">
+    <h1>Filter Transmission Viewer</h1>
+    
+    <div class="controls">
+      <input type="text" id="searchInput" placeholder="Search name, wavelength, or serial..." />
+      <div class="row">
+        <select id="typeFilter">
+          <option value="ALL">All Types</option>
+        </select>
+        <input type="number" id="wlFilter" placeholder="Target nm (e.g. 550)" />
+      </div>
+    </div>
+
+    <h2>Available Filters (<span id="matchCount">0</span>)</h2>
+    <div class="filter-list" id="filterList">
+      <div class="status">Loading data.csv...</div>
+    </div>
+
+    <h2>Plotted Spectra</h2>
+    <div class="active-tags" id="activeTags"></div>
+    <button class="btn-clear" id="clearBtn" style="display:none;">Clear All Spectra</button>
+  </div>
+
+  <!-- Right Main Area: Interactive Plot -->
+  <div class="panel">
+    <div id="chart"></div>
+  </div>
+</div>
+
+<script>
+  // ==========================================
+  // CONFIGURATION
+  // ==========================================
+  const CSV_FILENAME = 'data.csv'; // Must match the CSV filename in your GitHub repo
+  const COLORS = ['#2563eb', '#dc2626', '#16a34a', '#d97706', '#9333ea', '#0891b2', '#e11d48', '#4f46e5'];
+
+  let allFilters = [];
+  let selectedIds = [];
+
+  // Parse filter name (e.g., "SP425" -> type: "SP", cutoff: 425)
+  function parseFilterMetadata(rawName, rawSerial, index) {
+    const name = (rawName || '').trim();
+    const serial = (rawSerial || '').trim();
+    const match = name.match(/^([A-Za-z]+)\s*(\d+(?:\.\d+)?)/);
+    
+    return {
+      id: `filter_${index}`,
+      name: name || `Unknown_${index}`,
+      serial: serial || 'N/A',
+      type: match ? match[1].toUpperCase() : 'OTHER',
+      targetWavelength: match ? parseFloat(match[2]) : null,
+      wavelengths: [],
+      transmittance: []
+    };
+  }
+
+  // Load and parse the side-by-side CSV structure
+  async function init() {
+    try {
+      const response = await fetch(CSV_FILENAME);
+      if (!response.ok) throw new Error(`Could not load ${CSV_FILENAME} (HTTP ${response.status})`);
+      const csvText = await response.text();
+
+      Papa.parse(csvText, {
+        skipEmptyLines: true,
+        complete: function(results) {
+          const rows = results.data;
+          if (rows.length < 3) return;
+
+          const headerRow = rows[0]; // Row 0: Filter Name | Serial Number
+          // Row 1 is "Wavelengt" | "%T" (skipped for data extraction)
+
+          // Iterate in pairs of columns (0&1, 2&3, 4&5...)
+          for (let col = 0; col < headerRow.length; col += 2) {
+            const filterName = headerRow[col];
+            const serialNum = headerRow[col + 1];
+            if (!filterName && !serialNum) continue;
+
+            const filterObj = parseFilterMetadata(filterName, serialNum, col / 2);
+
+            for (let r = 2; r < rows.length; r++) {
+              const wl = parseFloat(rows[r][col]);
+              const tr = parseFloat(rows[r][col + 1]);
+              if (!isNaN(wl) && !isNaN(tr)) {
+                filterObj.wavelengths.push(wl);
+                filterObj.transmittance.push(tr);
+              }
+            }
+
+            // Sort ascending by wavelength so lines render cleanly left-to-right
+            const paired = filterObj.wavelengths.map((w, i) => ({ w, t: filterObj.transmittance[i] }));
+            paired.sort((a, b) => a.w - b.w);
+            filterObj.wavelengths = paired.map(p => p.w);
+            filterObj.transmittance = paired.map(p => p.t);
+
+            allFilters.push(filterObj);
+          }
+
+          populateTypeDropdown();
+          renderFilterList();
+          
+          // Automatically plot the first spectrum on load so the user sees an immediate example
+          if (allFilters.length > 0) {
+            toggleFilter(allFilters[0].id);
+          } else {
+            updateChart();
+          }
+        }
+      });
+    } catch (err) {
+      document.getElementById('filterList').innerHTML = `<div class="status" style="color:#dc2626;">Error: ${err.message}.<br>Ensure <b>${CSV_FILENAME}</b> is in the same folder and served via a web server / GitHub Pages.</div>`;
+    }
+  }
+
+  function populateTypeDropdown() {
+    const types = [...new Set(allFilters.map(f => f.type))].sort();
+    const select = document.getElementById('typeFilter');
+    types.forEach(t => {
+      const opt = document.createElement('option');
+      opt.value = t;
+      opt.textContent = `Type: ${t}`;
+      select.appendChild(opt);
+    });
+  }
+
+  function renderFilterList() {
+    const query = document.getElementById('searchInput').value.toLowerCase().trim();
+    const typeVal = document.getElementById('typeFilter').value;
+    const wlVal = document.getElementById('wlFilter').value.trim();
+
+    const filtered = allFilters.filter(f => {
+      const matchesText = !query || 
+        f.name.toLowerCase().includes(query) || 
+        f.serial.toLowerCase().includes(query) ||
+        (f.targetWavelength && f.targetWavelength.toString().includes(query));
+      
+      const matchesType = typeVal === 'ALL' || f.type === typeVal;
+      const matchesWl = !wlVal || (f.targetWavelength !== null && f.targetWavelength.toString().startsWith(wlVal));
+      
+      return matchesText && matchesType && matchesWl;
+    });
+
+    document.getElementById('matchCount').textContent = filtered.length;
+    const listEl = document.getElementById('filterList');
+    
+    if (filtered.length === 0) {
+      listEl.innerHTML = `<div class="status">No matching filters found.</div>`;
+      return;
+    }
+
+    listEl.innerHTML = filtered.map(f => {
+      const isAdded = selectedIds.includes(f.id);
+      return `
+        <div class="filter-item">
+          <div class="filter-meta">
+            <span class="filter-name">${f.name}</span>
+            <span class="filter-sub">SN: ${f.serial} ${f.targetWavelength ? `• ${f.targetWavelength} nm` : ''}</span>
+          </div>
+          <button class="btn-add" ${isAdded ? 'disabled' : ''} onclick="toggleFilter('${f.id}')">
+            ${isAdded ? 'Added' : '+ Plot'}
+          </button>
+        </div>
+      `;
+    }).join('');
+  }
+
+  function toggleFilter(id) {
+    if (selectedIds.includes(id)) {
+      selectedIds = selectedIds.filter(item => item !== id);
+    } else {
+      selectedIds.push(id);
+    }
+    renderFilterList();
+    renderActiveTags();
+    updateChart();
+  }
+
+  function renderActiveTags() {
+    const container = document.getElementById('activeTags');
+    const clearBtn = document.getElementById('clearBtn');
+    
+    clearBtn.style.display = selectedIds.length > 0 ? 'block' : 'none';
+
+    container.innerHTML = selectedIds.map((id, idx) => {
+      const f = allFilters.find(item => item.id === id);
+      const color = COLORS[idx % COLORS.length];
+      return `
+        <span class="tag" style="background:${color}">
+          ${f.name} (${f.serial})
+          <button onclick="toggleFilter('${id}')" title="Remove">&times;</button>
+        </span>
+      `;
+    }).join('');
+  }
+
+  function updateChart() {
+    const traces = [];
+    const shapes = [];
+    const annotations = [];
+
+    selectedIds.forEach((id, idx) => {
+      const f = allFilters.find(item => item.id === id);
+      const color = COLORS[idx % COLORS.length];
+
+      // Transmission curve
+      traces.push({
+        x: f.wavelengths,
+        y: f.transmittance,
+        mode: 'lines',
+        name: `${f.name} (${f.serial})`,
+        line: { color: color, width: 2.2 },
+        hovertemplate: `<b>${f.name}</b> (${f.serial})<br>Wavelength: %{x:.2f} nm<br>Transmission: %{y:.2f}%<extra></extra>`
+      });
+
+      // Black vertical reference line at the nominal wavelength parsed from the filter name
+      if (f.targetWavelength !== null) {
+        shapes.push({
+          type: 'line',
+          x0: f.targetWavelength,
+          x1: f.targetWavelength,
+          y0: 0,
+          y1: 1,
+          yref: 'paper',
+          line: {
+            color: '#000000',
+            width: 1.5,
+            dash: 'dash'
+          }
+        });
+
+        annotations.push({
+          x: f.targetWavelength,
+          y: 1.02,
+          yref: 'paper',
+          text: `${f.targetWavelength} nm`,
+          showarrow: false,
+          font: { size: 11, color: '#000000' }
+        });
+      }
+    });
+
+    const layout = {
+      title: selectedIds.length ? 'Filter Transmission Spectra' : 'Select a filter from the left panel to view its spectrum',
+      xaxis: {
+        title: 'Wavelength (nm)',
+        gridcolor: '#e2e8f0',
+        zeroline: false
+      },
+      yaxis: {
+        title: 'Transmission (%T)',
+        range: [0, 105],
+        gridcolor: '#e2e8f0',
+        zeroline: false
+      },
+      shapes: shapes,
+      annotations: annotations,
+      hovermode: 'x unified',
+      legend: { orientation: 'h', y: -0.15 },
+      margin: { t: 50, r: 30, b: 70, l: 60 },
+      plot_bgcolor: '#ffffff',
+      paper_bgcolor: '#ffffff'
+    };
+
+    Plotly.newPlot('chart', traces, layout, { responsive: true });
+  }
+
+  // Event Listeners
+  document.getElementById('searchInput').addEventListener('input', renderFilterList);
+  document.getElementById('typeFilter').addEventListener('change', renderFilterList);
+  document.getElementById('wlFilter').addEventListener('input', renderFilterList);
+  document.getElementById('clearBtn').addEventListener('click', () => {
+    selectedIds = [];
+    renderFilterList();
+    renderActiveTags();
+    updateChart();
+  });
+
+  // Start app
+  init();
+</script>
+</body>
+</html>
